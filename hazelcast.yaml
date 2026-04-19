@@ -1,0 +1,19 @@
+hazelcast:
+  cluster-name: dev
+
+  network:
+    join:
+      multicast:
+        enabled: false
+      tcp-ip:
+        enabled: true
+        member-list:
+          - hz1
+          - hz2
+          - hz3
+
+  map:
+    tx-map:
+      backup-count: 1
+    user-tx-map:
+      backup-count: 1

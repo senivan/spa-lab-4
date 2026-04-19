@@ -1,0 +1,166 @@
+services:
+  config-server:
+    build:
+      context: .
+      dockerfile: config-server/Dockerfile
+    environment:
+      SERVICE_NAME: config-server
+      SERVICE_URL: http://config-server:8500
+    ports:
+      - "8500:8500"
+
+  hz1:
+    image: hazelcast/hazelcast:5.3.7
+    container_name: hz1
+    environment:
+      HAZELCAST_CONFIG: /opt/hazelcast/config/hazelcast.yaml
+    volumes:
+      - ./hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml:ro
+    ports:
+      - "5701:5701"
+
+  hz2:
+    image: hazelcast/hazelcast:5.3.7
+    container_name: hz2
+    environment:
+      HAZELCAST_CONFIG: /opt/hazelcast/config/hazelcast.yaml
+    volumes:
+      - ./hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml:ro
+    ports:
+      - "5702:5701"
+
+  hz3:
+    image: hazelcast/hazelcast:5.3.7
+    container_name: hz3
+    environment:
+      HAZELCAST_CONFIG: /opt/hazelcast/config/hazelcast.yaml
+    volumes:
+      - ./hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml:ro
+    ports:
+      - "5703:5701"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: lab3-postgres
+    environment:
+      POSTGRES_DB: lab3
+      POSTGRES_USER: lab3
+      POSTGRES_PASSWORD: lab3
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab3 -d lab3"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  logging1:
+    build:
+      context: .
+      dockerfile: logging-service/Dockerfile
+    environment:
+      INSTANCE_NAME: logging1
+      SERVICE_NAME: logging-service
+      SERVICE_URL: http://logging1:8001
+      CONFIG_SERVER_URL: http://config-server:8500
+      HZ_CLUSTER_MEMBERS: hz1:5701,hz2:5701,hz3:5701
+      HZ_CLUSTER_NAME: dev
+      LOG_PORT: "8001"
+    ports:
+      - "8001:8001"
+    depends_on:
+      - config-server
+      - hz1
+      - hz2
+      - hz3
+
+  logging2:
+    build:
+      context: .
+      dockerfile: logging-service/Dockerfile
+    environment:
+      INSTANCE_NAME: logging2
+      SERVICE_NAME: logging-service
+      SERVICE_URL: http://logging2:8001
+      CONFIG_SERVER_URL: http://config-server:8500
+      HZ_CLUSTER_MEMBERS: hz1:5701,hz2:5701,hz3:5701
+      HZ_CLUSTER_NAME: dev
+      LOG_PORT: "8001"
+    ports:
+      - "8003:8001"
+    depends_on:
+      - config-server
+      - hz1
+      - hz2
+      - hz3
+
+  logging3:
+    build:
+      context: .
+      dockerfile: logging-service/Dockerfile
+    environment:
+      INSTANCE_NAME: logging3
+      SERVICE_NAME: logging-service
+      SERVICE_URL: http://logging3:8001
+      CONFIG_SERVER_URL: http://config-server:8500
+      HZ_CLUSTER_MEMBERS: hz1:5701,hz2:5701,hz3:5701
+      HZ_CLUSTER_NAME: dev
+      LOG_PORT: "8001"
+    depends_on:
+      - config-server
+      - hz1
+      - hz2
+      - hz3
+    ports:
+      - "8004:8001"
+
+  counter-service:
+    build:
+      context: .
+      dockerfile: counter-service/Dockerfile
+    environment:
+      INSTANCE_NAME: counter-service
+      SERVICE_NAME: counter-service
+      SERVICE_URL: http://counter-service:8002
+      CONFIG_SERVER_URL: http://config-server:8500
+      DATABASE_URL: postgresql+psycopg://lab3:lab3@postgres:5432/lab3
+      HZ_CLUSTER_MEMBERS: hz1:5701,hz2:5701,hz3:5701
+      HZ_CLUSTER_NAME: dev
+      COUNTER_QUEUE_NAME: counter-tx-queue
+    ports:
+      - "8002:8002"
+    depends_on:
+      config-server:
+        condition: service_started
+      hz1:
+        condition: service_started
+      hz2:
+        condition: service_started
+      hz3:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+  facade-service:
+    build:
+      context: .
+      dockerfile: facade-service/Dockerfile
+    environment:
+      INSTANCE_NAME: facade-service
+      SERVICE_NAME: facade-service
+      SERVICE_URL: http://facade-service:8000
+      CONFIG_SERVER_URL: http://config-server:8500
+      HZ_CLUSTER_MEMBERS: hz1:5701,hz2:5701,hz3:5701
+      HZ_CLUSTER_NAME: dev
+      COUNTER_QUEUE_NAME: counter-tx-queue
+    ports:
+      - "8000:8000"
+    depends_on:
+      - config-server
+      - hz1
+      - hz2
+      - hz3
+      - logging1
+      - logging2
+      - logging3
+      - counter-service

@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package logging;
+
+service LoggingService {
+  rpc StoreTransaction (TransactionRequest) returns (TransactionReply);
+  rpc GetTransactionsByUser (UserRequest) returns (TransactionsReply);
+}
+
+message TransactionRequest {
+  string transaction_id = 1;
+  string timestamp = 2;
+  string user_id = 3;
+  int32 amount = 4;
+  string message = 5;
+}
+
+message UserRequest {
+  string user_id = 1;
+}
+
+message TransactionReply {
+  bool ok = 1;
+  string instance = 2;
+}
+
+message TransactionsReply {
+  repeated TransactionRequest transactions = 1;
+}
