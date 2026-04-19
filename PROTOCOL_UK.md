@@ -1,529 +1,393 @@
-# Протокол тестування мікросервісної архітектури з Hazelcast
+# Протокол до лабораторної роботи 4
 
-**Дата**: 6 квітня 2026  
-**Проект**: Мікросервіси з розподіленим кешуванням Hazelcast  
-**Статус**: ✅ Всі тести пройдені (6/6)
+**Тема**: Мікросервіси з використанням Messaging Queue  
+**Дата**: 19 квітня 2026  
+**Гілка**: `micro_mq`  
+**Коміт**: `d26b545`  
+**Статус**: реалізацію завершено, основні сценарії перевірено
 
----
+GitHub репозиторій: `TODO: додати URL після push`
 
-## 📋 Зміст
+## 1. Мета роботи
 
-1. [Опис проекту](#опис-проекту)
-2. [Архітектура системи](#архітектура-системи)
-3. [API Endpoints](#api-endpoints)
-4. [Приклади запитів та відповідей](#приклади-запитів-та-відповідей)
-5. [Логи мікросервісів](#логи-мікросервісів)
-6. [Результати тестування](#результати-тестування)
-7. [Інструкції по запуску](#інструкції-по-запуску)
+Розширити попередню мікросервісну систему так, щоб:
 
----
-Github репозиторій: [https://github.com/senivan/SPA-lab-3]()
-## Опис проекту
+- запис транзакцій у `counter-service` відбувався асинхронно через чергу повідомлень;
+- `facade-service` для читання даних і далі використовував HTTP GET;
+- адреси мікросервісів не були захардкожені у `facade-service`, а отримувались через `config-server`;
+- система зберігала працездатність при тимчасовій недоступності `counter-service`.
 
-Проект демонструє сучасну мікросервісну архітектуру з використанням:
+## 2. Що було реалізовано
 
-- **FastAPI** - веб-фреймворк для створення HTTP API
-- **Hazelcast** - розподілена система кешування та обробки даних
-- **PostgreSQL** - реляційна база даних для постійного збереження
-- **Docker Compose** - оркестрування контейнерів
+### 2.1. Новий `config-server`
 
-### Головні компоненти:
+Додано окремий сервіс `config-server`, який виконує роль простого реєстру сервісів.
 
-| Сервіс | Порт | Функція |
-|--------|------|---------|
-| **Facade Service** | 8000 | Маршрутизація запитів, балансування навантаження |
-| **Counter Service** | 8002 | Управління балансами користувачів, PostgreSQL |
-| **Logging Service** (3x) | 8001 | Розподілене журналювання трансакцій в Hazelcast |
-| **Hazelcast Cluster** | 5701-5703 | Розподілена пам'ять та обробка подій |
-| **PostgreSQL** | 5432 | База даних для балансів |
+Реалізовані endpoint-и:
 
----
+- `POST /register`  
+  Реєстрація сервісу у форматі:
+  ```json
+  {
+    "service_name": "logging-service",
+    "service_url": "http://logging1:8001"
+  }
+  ```
+- `GET /services/{service_name}`  
+  Повернення списку всіх зареєстрованих інстансів сервісу.
 
-## Архітектура системи
+### 2.2. Самореєстрація мікросервісів
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      CLIENT / TEST SUITE                    │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-                   ┌──────────────────┐
-                   │ FACADE SERVICE   │ (Port 8000)
-                   │  Load Balancer   │
-                   └────────┬─────────┘
-                            │
-           ┌────────────────┼────────────────┐
-           ▼                ▼                ▼
-    ┌─────────────┐ ┌────────────────┐ ┌──────────────┐
-    │ COUNTER     │ │ LOGGING        │ │ LOGGING      │
-    │ SERVICE     │ │ SERVICE 1      │ │ SERVICE 2/3  │
-    │ (Port 8002) │ │ (Port 8001)    │ │ (Internal)   │
-    └─────┬───────┘ └────────┬───────┘ └──────┬───────┘
-          │                  │                 │
-          ▼                  └────────┬────────┘
-    ┌─────────────┐                  │
-    │ PostgreSQL  │      ┌───────────▼─────────┐
-    │   Database  │      │ HAZELCAST CLUSTER   │
-    │  (Port 5432)│      │  hz1, hz2, hz3      │
-    └─────────────┘      │ (Ports 5701-5703)   │
-                         └─────────────────────┘
-```
+При старті сервісів:
 
----
+- `facade-service`
+- `counter-service`
+- `logging-service` (усі 3 екземпляри)
 
-## API Endpoints
+вони автоматично виконують `POST /register` до `config-server`.
 
-### 1. **Facde Service Endpoints**
+### 2.3. Service discovery у `facade-service`
 
-#### POST /transaction
-Створення нової трансакції для користувача
+Раніше `facade-service` використовував захардкожені адреси `logging-service` і `counter-service`.
 
-```
-POST http://localhost:8000/transaction
-Content-Type: application/json
+Тепер логіка така:
 
+- перед зверненням до `logging-service` або `counter-service` виконується запит до `config-server`;
+- для `logging-service` із поверненого списку випадково вибирається один інстанс;
+- для `counter-service` також використовується адреса з реєстру.
+
+### 2.4. Messaging Queue між `facade-service` і `counter-service`
+
+У якості MQ використано `Hazelcast Queue`.
+
+Зміни:
+
+- `POST /transaction` у `facade-service` більше не викликає `counter-service` напряму;
+- після логування транзакції `facade-service` поміщає повідомлення в чергу `counter-tx-queue`;
+- `counter-service` у фоновому режимі читає повідомлення з черги та застосовує їх до PostgreSQL.
+
+Схема роботи:
+
+1. клієнт надсилає `POST /transaction` до `facade-service`;
+2. `facade-service` вибирає один з `logging-service` через `config-server` і зберігає транзакцію в Hazelcast Map;
+3. `facade-service` ставить транзакцію в Hazelcast Queue;
+4. `counter-service` читає транзакцію з черги;
+5. `counter-service` оновлює баланс у PostgreSQL.
+
+### 2.5. Поведінка `GET /user/{user_id}`
+
+Для читання даних логіка залишилась синхронною:
+
+- список транзакцій читається з `logging-service`;
+- баланс читається з `counter-service`.
+
+Якщо `counter-service` тимчасово недоступний, `facade-service` повертає:
+
+```json
 {
-  "user_id": "user001",
-  "amount": 500,
-  "message": "Deposit"
+  "balance": null,
+  "transactions": [...],
+  "counter_available": false
 }
 ```
 
-**Параметри запиту:**
-- `user_id` (string) - унікальний ідентифікатор користувача
-- `amount` (integer) - сума трансакції
-- `message` (string, optional) - описання трансакції
+Це відповідає вимозі лабораторної роботи повертати `null` або еквівалентну ознаку недоступності.
 
----
+## 3. Архітектура системи
 
-#### GET /user/{user_id}
-Отримання інформації про користувача та його трансакції
+```text
+Клієнт
+  |
+  v
+facade-service (8000)
+  | \
+  |  \--> config-server (8500) -> отримання адрес сервісів
+  |
+  +--> logging-service[1..3] -> збереження транзакцій у Hazelcast Map
+  |
+  +--> Hazelcast Queue -> асинхронна передача транзакцій
+                           |
+                           v
+                      counter-service (8002)
+                           |
+                           v
+                      PostgreSQL (5432)
 
-```
-GET http://localhost:8000/user/{user_id}
-```
-
-**Параметри:**
-- `user_id` - ідентифікатор користувача
-
----
-
-#### GET /metrics
-Отримання метрик продуктивності системи
-
-```
-GET http://localhost:8000/metrics
-```
-
----
-
-#### POST /metrics/reset
-Скидання метрик
-
-```
-POST http://localhost:8000/metrics/reset
+Hazelcast cluster:
+- hz1:5701
+- hz2:5701
+- hz3:5701
 ```
 
----
+## 4. Склад docker-compose
 
-### 2. **Counter Service Endpoints**
+Піднімаються такі сервіси:
 
-#### POST /transactions/apply
-Застосування трансакції (внутрішній API)
+- `config-server`
+- `facade-service`
+- `counter-service`
+- `logging1`
+- `logging2`
+- `logging3`
+- `hz1`
+- `hz2`
+- `hz3`
+- `postgres`
 
-```
-POST http://localhost:8002/transactions/apply
-```
+Host ports:
 
----
+- `facade-service` -> `8000`
+- `counter-service` -> `8002`
+- `logging1` -> `8001`
+- `logging2` -> `8003`
+- `logging3` -> `8004`
+- `config-server` -> `8500`
 
-#### GET /balance/{user_id}
-Отримання поточного балансу користувача
+Примітка: у вихідному compose з попередньої роботи був конфлікт host-порту `8002` між `logging2` і `counter-service`. Для коректного запуску його виправлено.
 
-```
-GET http://localhost:8002/balance/{user_id}
-```
+## 5. Основні файли, які були змінені
 
----
+- [config-server/app/main.py](/Users/ivansen/Documents/SPA/04-msg-q/config-server/app/main.py)
+- [facade-service/app/main.py](/Users/ivansen/Documents/SPA/04-msg-q/facade-service/app/main.py)
+- [counter-service/app/main.py](/Users/ivansen/Documents/SPA/04-msg-q/counter-service/app/main.py)
+- [logging-service/app/main.py](/Users/ivansen/Documents/SPA/04-msg-q/logging-service/app/main.py)
+- [docker-compose.yml](/Users/ivansen/Documents/SPA/04-msg-q/docker-compose.yml)
 
-#### GET /balances
-Отримання всіх балансів користувачів
+## 6. API та приклади запитів
 
-```
-GET http://localhost:8002/balances
-```
+### 6.1. Запис транзакції
 
----
-
-#### POST /reset
-Скидання бази даних (очищення всіх трансакцій і балансів)
-
-```
-POST http://localhost:8002/reset
-```
-
----
-
-### 3. **Logging Service Endpoints**
-
-#### POST /transactions
-Реєстрація трансакції в розподіленому журналі
-
-```
-POST http://localhost:8001/transactions
-```
-
----
-
-#### GET /transactions
-Отримання всіх трансакцій
-
-```
-GET http://localhost:8001/transactions
-```
-
----
-
-#### GET /transactions/user/{user_id}
-Отримання трансакцій конкретного користувача
-
-```
-GET http://localhost:8001/transactions/user/{user_id}
-```
-
----
-
-## Приклади запитів та відповідей
-
-### Приклад 1: Створення трансакції
-
-**Запит:**
 ```bash
 curl -X POST http://localhost:8000/transaction \
   -H "Content-Type: application/json" \
   -d '{
-    "user_id": "user001",
-    "amount": 500,
-    "message": "Deposit"
+    "user_id": "user1",
+    "amount": 5,
+    "message": "msg1"
   }'
 ```
 
-**Відповідь (200 OK):**
+Приклад відповіді:
+
 ```json
 {
-  "transaction_id": "1775474968266469592",
-  "balance": 1000,
+  "transaction_id": "1776585715815158091",
+  "queued": true,
   "logging": {
     "ok": true,
-    "instance": "logging2",
-    "transaction_id": "1775474968266469592"
+    "instance": "logging3",
+    "transaction_id": "1776585715815158091"
   }
 }
 ```
 
-**Опис:**
-- `transaction_id` - унікальний ідентифікатор трансакції (Unix timestamp в наносекундах)
-- `balance` - нов обалансу після трансакції
-- `logging.instance` - інстанс сервісу логування, який оброблював запит
-- `logging.ok` - статус успішного логування в Hazelcast
+Пояснення:
 
----
+- `queued: true` означає, що транзакція успішно поставлена в MQ;
+- поле `logging.instance` показує, який екземпляр `logging-service` обробив запит.
 
-### Приклад 2: Отримання користувача та його трансакцій
+### 6.2. Читання балансу та історії транзакцій
 
-**Запит:**
 ```bash
-curl http://localhost:8000/user/user001
+curl http://localhost:8000/user/user1
 ```
 
-**Відповідь (200 OK):**
+Приклад відповіді:
+
 ```json
 {
-  "balance": 1000,
+  "balance": 12,
   "transactions": [
     {
-      "transaction_id": "1775474963191466881",
-      "timestamp": "2026-04-06T11:29:23",
-      "user_id": "user001",
-      "amount": 500,
-      "message": "Deposit"
+      "transaction_id": "1776585715794361590",
+      "timestamp": "2026-04-19T08:01:55",
+      "user_id": "user1",
+      "amount": 7,
+      "message": "msg2"
     },
     {
-      "transaction_id": "1775474968266469592",
-      "timestamp": "2026-04-06T11:29:28",
-      "user_id": "user001",
-      "amount": 500,
-      "message": "Deposit"
+      "transaction_id": "1776585715815158091",
+      "timestamp": "2026-04-19T08:01:55",
+      "user_id": "user1",
+      "amount": 5,
+      "message": "msg1"
     }
-  ]
+  ],
+  "counter_available": true
 }
 ```
 
-**Опис:**
-- `balance` - поточний баланс користувача
-- `transactions` - масив всіх трансакцій користувача з сервера логування (Hazelcast)
+### 6.3. Читання при недоступному `counter-service`
 
----
+Після `docker pause` для `counter-service`:
 
-### Приклад 3: Отримання всіх балансів
-
-**Запит:**
 ```bash
-curl http://localhost:8002/balances
+curl http://localhost:8000/user/user3
 ```
 
-**Відповідь (200 OK):**
+Отримана відповідь:
+
 ```json
 {
-  "user123": 100,
-  "user456": 300,
-  "user_a": 200,
-  "user_b": 300,
-  "user_c": 150,
-  "user001": 1000
+  "balance": null,
+  "transactions": [
+    {
+      "transaction_id": "1776585737943127587",
+      "timestamp": "2026-04-19T08:02:17",
+      "user_id": "user3",
+      "amount": 10,
+      "message": "msg-paused"
+    }
+  ],
+  "counter_available": false,
+  "counter_error": ""
 }
 ```
 
-**Опис:**
-- Ключ-значення пари з балансами всіх користувачів з PostgreSQL
+Після `docker unpause` для `counter-service`:
 
----
-
-### Приклад 4: Отримання метрик
-
-**Запит:**
 ```bash
-curl http://localhost:8000/metrics
+curl http://localhost:8000/user/user3
 ```
 
-**Відповідь (200 OK):**
+Отримана відповідь:
+
 ```json
 {
-  "logging_calls": 12,
-  "counter_calls": 12,
-  "logging_total_sec": 0.2500244989978455,
-  "counter_total_sec": 0.15586000099938246,
-  "logging_avg_ms": 20.835374916487126,
-  "counter_avg_ms": 12.988333416615205
+  "balance": 10,
+  "transactions": [
+    {
+      "transaction_id": "1776585737943127587",
+      "timestamp": "2026-04-19T08:02:17",
+      "user_id": "user3",
+      "amount": 10,
+      "message": "msg-paused"
+    }
+  ],
+  "counter_available": true
 }
 ```
 
-**Опис:**
-- `logging_calls` - кількість викликів сервісу логування
-- `counter_calls` - кількість викликів сервісу балансів
-- `logging_total_sec` - загальний час виконання запитів до логування (сек)
-- `counter_total_sec` - загальний час виконання запитів до балансів (сек)
-- `logging_avg_ms` - середній час відповіді логування (мс)
-- `counter_avg_ms` - середній час відповіді балансів (мс)
+## 7. Фрагменти логів
 
----
+### 7.1. Реєстрація сервісів у `config-server`
 
-## Логи мікросервісів
-
-### Facade Service
-
-```
-facade-service-1  | INFO:     138.197.232.106:45402 - "POST /transaction HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:61423 - "POST /transaction HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:39714 - "POST /transaction HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:28507 - "POST /transaction HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:20316 - "GET /user/user456 HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:49463 - "POST /transaction HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:54573 - "POST /transaction HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:16706 - "POST /transaction HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:54228 - "GET /metrics HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:59907 - "POST /transaction HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:16933 - "GET /user/user001 HTTP/1.1" 200 OK
-facade-service-1  | INFO:     138.197.232.106:43645 - "GET /metrics HTTP/1.1" 200 OK
+```text
+[config-server] registered logging-service -> http://logging1:8001
+[config-server] registered logging-service -> http://logging2:8001
+[config-server] registered logging-service -> http://logging3:8001
+[config-server] registered facade-service -> http://facade-service:8000
+[config-server] registered counter-service -> http://counter-service:8002
 ```
 
-**Опис логів:**
-- IP адреса та порт клієнта
-- HTTP метод та endpoint
-- Статус код (200 = успіх)
-- Всі запити оброблюються успішно без помилок
+### 7.2. Використання різних екземплярів `logging-service`
 
----
-
-### Counter Service
-
-```
-counter-service-1  | [counter] user_b += 300 -> 300
-counter-service-1  | INFO:     172.19.0.10:39992 - "POST /transactions/apply HTTP/1.1" 200 OK
-counter-service-1  | [counter] user_c += 150 -> 150
-counter-service-1  | INFO:     172.19.0.10:40008 - "POST /transactions/apply HTTP/1.1" 200 OK
-counter-service-1  | INFO:     138.197.232.106:39253 - "GET /balance/user_a HTTP/1.1" 200 OK
-counter-service-1  | INFO:     138.197.232.106:64815 - "GET /balance/user_b HTTP/1.1" 200 OK
-counter-service-1  | INFO:     138.197.232.106:57718 - "GET /balance/user_c HTTP/1.1" 200 OK
-counter-service-1  | [counter] user001 += 500 -> 500
-counter-service-1  | INFO:     172.19.0.10:57246 - "POST /transactions/apply HTTP/1.1" 200 OK
-counter-service-1  | INFO:     172.19.0.10:57248 - "GET /balance/user001 HTTP/1.1" 200 OK
-counter-service-1  | INFO:     138.197.232.106:17980 - "GET /balances HTTP/1.1" 200 OK
-counter-service-1  | [counter] user001 += 500 -> 1000
-counter-service-1  | INFO:     172.19.0.10:57250 - "POST /transactions/apply HTTP/1.1" 200 OK
-counter-service-1  | INFO:     172.19.0.10:57258 - "GET /balance/user001 HTTP/1.1" 200 OK
-counter-service-1  | INFO:     138.197.232.106:39179 - "GET /balances HTTP/1.1" 200 OK
+```text
+[facade-service] logging via http://logging1:8001
+[facade-service] logging via http://logging3:8001
 ```
 
-**Опис логів:**
-- `[counter] user_XXX += Amount -> NewBalance` - внутрішній лог операції додавання до балансу
-- Показує трансформацію балансу для кожної ПОСТトрансакції
-- Приклад: користувач `user001` отримав 2 депозити по 500 гривень = 1000
+Це підтверджує, що `facade-service` не працює з одним жорстко заданим інстансом, а вибирає сервіс з реєстру.
 
----
+### 7.3. Поміщення транзакцій у чергу
 
-### Logging Service
-
-```
-logging1-1  | INFO:     Started server process [1]
-logging1-1  | INFO:     Waiting for application startup.
-logging1-1  | [logging1] connected to Hazelcast members=['hz1:5701', 'hz2:5701', 'hz3:5701']
-logging1-1  | INFO:     Application startup complete.
-logging1-1  | INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
-logging1-1  | [logging1] stored 1775474197131948346 for user123
-logging1-1  | INFO:     172.19.0.10:46736 - "POST /transactions HTTP/1.1" 200 OK
-logging1-1  | [logging1] stored 1775474197434877888 for user456
-logging1-1  | INFO:     172.19.0.10:46742 - "POST /transactions HTTP/1.1" 200 OK
-logging1-1  | [logging1] stored 1775474197634417263 for user_b
-logging1-1  | INFO:     172.19.0.10:46750 - "POST /transactions HTTP/1.1" 200 OK
-logging1-1  | [logging1] read 1 tx for user001
-logging1-1  | INFO:     172.19.0.10:46378 - "GET /transactions/user/user001 HTTP/1.1" 200 OK
+```text
+[facade-service] queued transaction 1776585725867718804 for counter-service
+[facade-service] queued transaction 1776585737943127587 for counter-service
 ```
 
-**Опис логів:**
-- `[logging1] connected to Hazelcast members=[...]` - успішне підключення до Hazelcast кластера
-- `[logging1] stored TransactionID for UserID` - трансакція збережена в розподіленій карті
-- `[logging1] read N tx for user` - читання трансакцій користувача з Hazelcast
-- Інстанс `logging1` обробляє запити та синхронізує дані між вузлами кластера
+### 7.4. Обробка транзакцій `counter-service`
 
----
+```text
+[counter-service] user2 += 1 -> 1
+[counter-service] consumed queued transaction 1776585725867718804
+[counter-service] user2 += 1 -> 2
+[counter-service] consumed queued transaction 1776585725937368054
+[counter-service] user3 += 10 -> 10
+[counter-service] consumed queued transaction 1776585737943127587
+```
 
-## Результати тестування
+## 8. Перевірка вимог завдання
 
-### Статус тестів: ✅ 6/6 пройдено
+### Вимога 1. Розгорнути Messaging Queue
 
-| № | Тест | Результат | Деталі |
-|---|------|-----------|--------|
-| 1 | Service Connectivity | ✅ PASS | Всі сервіси доступні |
-| 2 | Reset Services | ✅ PASS | Успішне очищення даних |
-| 3 | Transaction Flow | ✅ PASS | Трансакція: user001 +100 = 100 |
-| 4 | Multiple Transactions | ✅ PASS | 3 трансакції: 50+100+150 = 300 |
-| 5 | Concurrent Users | ✅ PASS | 3 користувачі: 200+300+150 = 650 |
-| 6 | Metrics Collection | ✅ PASS | 12 викликів логування, 12 викликів балансів |
+Виконано.  
+Використано `Hazelcast Queue` з назвою `counter-tx-queue`.
 
-### Метрики продуктивності:
-- **Logging avg**: 20.8 мс на запит
-- **Counter avg**: 12.9 мс на запит
-- **Total operations**: 12 успішних викликів кожного сервісу
-- **Success rate**: 100%
+### Вимога 2. `POST` у `facade-service` додає повідомлення до черги
 
----
+Виконано.  
+`facade-service` після логування транзакції викликає `put()` у Hazelcast Queue.
 
-## Інструкції по запуску
+### Вимога 3. `counter-service` читає повідомлення як consumer
 
-### Переддумови:
-- Docker & Docker Compose
-- Python 3.11+
-- Python пакет: `requests`
+Виконано.  
+Запущено фоновий цикл читання черги з подальшим оновленням PostgreSQL.
 
-### 1. Запуск сервісів
+### Вимога 4. `GET` залишився HTTP-запитом до `counter-service`
+
+Виконано.  
+Читання балансу відбувається через HTTP `GET /balance/{user_id}`.
+
+### Вимога 5. Додати `config-server`
+
+Виконано.  
+Усі сервіси реєструються через `POST /register`, а `facade-service` читає адреси через `GET /services/{service_name}`.
+
+### Вимога 6. Показати, що різні `logging-service` отримують повідомлення
+
+Виконано.  
+У логах зафіксовано використання щонайменше `logging1` і `logging3`.
+
+### Вимога 7. Перевірка відмовостійкості
+
+Виконано.  
+При `docker pause` для `counter-service`:
+
+- `POST /transaction` продовжує повертати успіх;
+- `GET /user/{user_id}` повертає `balance: null`;
+- після `docker unpause` накопичена транзакція обробляється;
+- баланс стає коректним.
+
+## 9. Команди для запуску
+
+### Запуск системи
 
 ```bash
-cd 03-microservices-with-hazelcast
-
-# Очищення та перебудова
-docker compose down --remove-orphans
 docker compose up -d --build
+```
 
-# Перевірка статусу
+### Перевірка стану контейнерів
+
+```bash
 docker compose ps
 ```
 
-### 2. Запуск тестів
+### Перегляд логів
 
 ```bash
-# Установка залежностей
-pip install --break-system-packages requests
-
-# Запуск full test suite
-python3 e2e_test.py
-```
-
-### 3. Мануальне тестування API
-
-```bash
-# Приклад 1: Створення трансакції
-curl -X POST http://localhost:8000/transaction \
-  -H "Content-Type: application/json" \
-  -d '{"user_id":"user001","amount":500,"message":"Deposit"}'
-
-# Приклад 2: Отримання користувача
-curl http://localhost:8000/user/user001
-
-# Приклад 3: Отримання метрик
-curl http://localhost:8000/metrics
-
-# Приклад 4: Отримання балансів
-curl http://localhost:8002/balances
-```
-
-### 4. Перегляд логів
-
-```bash
-# Всі логи
 docker compose logs -f
-
-# Логи конкретного сервісу
-docker compose logs -f facade-service
-docker compose logs -f counter-service
-docker compose logs -f logging1
-
-# Останні 50 рядків
-docker compose logs --tail=50 facade-service
 ```
 
-### 5. Ремонт системи
+### Симуляція відмови `counter-service`
 
 ```bash
-# Скидання всіх даних
-docker compose down --volumes
-
-# Перезапуск конкретного сервісу
-docker compose restart counter-service
-
-# Перебудова зображення
-docker compose build --no-cache
-docker compose up -d
+docker pause 04-msg-q-counter-service-1
 ```
 
----
+### Повернення сервісу в роботу
 
-## Властивості системи
+```bash
+docker unpause 04-msg-q-counter-service-1
+```
 
-### ✅ Забезпечені властивості:
+## 10. Висновок
 
-- **Масштабованість**: Кількість мікросервісів може збільшуватись незалежно
-- **Надійність**: Трьирівневий Hazelcast кластер для високої доступності
-- **Постійність**: PostgreSQL для постійного збереження балансів
-- **Моніторинг**: Вбудовані метрики для відстеження продуктивності
-- **Розподіленість**: Логування трансакцій в Hazelcast для синхронізації між сервісами
-- **HTTP-only**: Всі сервіси спілкуються через HTTP (без gRPC)
+У лабораторній роботі реалізовано асинхронну взаємодію між `facade-service` і `counter-service` через `Hazelcast Queue`, а також додано `config-server` для service discovery. Система тепер підтримує:
 
-### 🔒 Забезпечена безпека:
+- динамічний вибір інстансів `logging-service`;
+- асинхронний запис транзакцій;
+- накопичення повідомлень при тимчасовій недоступності `counter-service`;
+- коректне відновлення після повернення сервісу в роботу.
 
-- Docker контейнери для ізоляції
-- Внутрішня мережа Docker для комунікації
-- PostgreSQL з автентифікацією (user: lab3, pass: lab3)
-- Keine sensitive дані в логах
-
----
-
-## Висновки
-
-Система успішно демонструє:
-
-1. ✅ **Мікросервісну архітектуру** - розділення відповідальності між сервісами
-2. ✅ **Розподілене кешування** - Hazelcast для синхронізації даних
-3. ✅ **Масштабованість** - горизонтальне розширення через додаткові інстанси
-4. ✅ **Надійність** - резервування трьома Hazelcast вузлами
-5. ✅ **Моніторинг** - вбудовані метрики та логи для діагностики
+Поставлені у завданні вимоги реалізовані.
